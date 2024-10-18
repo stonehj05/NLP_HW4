@@ -1,0 +1,5 @@
+1	ROOT	S
+1	S	and are we NP
+0.8	NP	Det N
+0.5	N	caviar
+0.5	Det	the

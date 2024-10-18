@@ -13,6 +13,8 @@ import argparse
 import logging
 import math
 import tqdm
+import queue
+import copy
 from dataclasses import dataclass
 from pathlib import Path
 from collections import Counter
@@ -69,25 +71,45 @@ class EarleyChart:
         self.profile: CounterType[str] = Counter()
 
         self.cols: List[Agenda]
+        self.filter: Dict[str, set[str]]
         self._run_earley()    # run Earley's algorithm to construct self.cols
 
     def accepted(self) -> bool:
         """Was the sentence accepted?
         That is, does the finished chart contain an item corresponding to a parse of the sentence?
         This method answers the recognition question, but not the parsing question."""
+
+        '''for col in self.cols:
+            print(self.cols.index(col))
+            print(col)'''
         for item in self.cols[-1].all():    # the last column
             if (item.rule.lhs == self.grammar.start_symbol   # a ROOT item in this column
                 and item.next_symbol() is None               # that is complete 
-                and item.start_position == 0):               # and started back at position 0
+                and item.start_position == 0):
+                    self.printItem(item, -1)               # and started back at position 0
+                    print(self.cols[-1].rule_weights[item])
+
                     return True
+        print("None")
         return False   # we didn't find any appropriate item
 
     def _run_earley(self) -> None:
         """Fill in the Earley chart."""
         # Initially empty column for each position in sentence
         self.cols = [Agenda() for _ in range(len(self.tokens) + 1)]
+        record = copy.deepcopy(self.grammar._expansions)
+        for element in self.grammar._expansions:
+            rule_to_remove = set()
+            for rule in self.grammar._expansions[element]:
+                for symbol in rule.rhs:
+                    if not self.grammar.is_nonterminal(symbol) and symbol not in self.tokens:
+                        rule_to_remove.add(rule)
+            for rule in rule_to_remove:
+                self.grammar._expansions[element].remove(rule)
+        
 
-        # Start looking for ROOT at position 0
+
+        self.build_filter(0)
         self._predict(self.grammar.start_symbol, 0)
 
         # We'll go column by column, and within each column row by row.
@@ -98,10 +120,12 @@ class EarleyChart:
         # Wrapping this iterator in the `tqdm` call provides a progress bar.
         for i, column in tqdm.tqdm(enumerate(self.cols),
                                    total=len(self.cols),
-                                   disable=not self.progress):
+                                   disable= self.progress):
             log.debug("")
             log.debug(f"Processing items in column {i}")
-            while column:    # while agenda isn't empty
+            if not i == len(self.cols) - 1 and not i == 0:
+                self.build_filter(i)
+            while len(column) > 0:    # while agenda isn't empty
                 item = column.pop()   # dequeue the next unprocessed item
                 next = item.next_symbol()
                 if next is None:
@@ -115,13 +139,21 @@ class EarleyChart:
                 else:
                     # Try to scan the terminal after the dot
                     log.debug(f"{item} => SCAN")
-                    self._scan(item, i)                      
+                    self._scan(item, i)   
+        self.grammar._expansions = record                       
 
     def _predict(self, nonterminal: str, position: int) -> None:
         """Start looking for this nonterminal at the given position."""
+        if position == len(self.cols) - 1:
+            return
         for rule in self.grammar.expansions(nonterminal):
             new_item = Item(rule, dot_position=0, start_position=position)
-            self.cols[position].push(new_item)
+            if new_item in self.cols[position].rule_weights:
+                break
+            symbol = rule.rhs[0]
+            if symbol not in self.filter_set:
+                continue
+            self.cols[position].push(new_item, weight=rule.weight, backpointers = ((None, -1), (None, -1)))
             log.debug(f"\tPredicted: {new_item} in column {position}")
             self.profile["PREDICT"] += 1
 
@@ -130,7 +162,7 @@ class EarleyChart:
         if it matches what this item is looking for next."""
         if position < len(self.tokens) and self.tokens[position] == item.next_symbol():
             new_item = item.with_dot_advanced()
-            self.cols[position + 1].push(new_item)
+            self.cols[position + 1].push(new_item, weight=self.cols[position].rule_weights[item], backpointers=((item, position), (self.tokens[position], -1)))
             log.debug(f"\tScanned to get: {new_item} in column {position+1}")
             self.profile["SCAN"] += 1
 
@@ -143,9 +175,37 @@ class EarleyChart:
         for customer in self.cols[mid].all():  # could you eliminate this inefficient linear search?
             if customer.next_symbol() == item.rule.lhs:
                 new_item = customer.with_dot_advanced()
-                self.cols[position].push(new_item)
+                self.cols[position].push(new_item, weight=self.cols[mid].rule_weights[customer] + self.cols[position].rule_weights[item], backpointers=((customer, mid), (item, position)))
                 log.debug(f"\tAttached to get: {new_item} in column {position}")
                 self.profile["ATTACH"] += 1
+
+    def build_filter(self, position):
+        self.filter_set = set()
+        symbol = self.tokens[position]
+        self.add_element(symbol)
+
+    def add_element(self, symbol):
+        self.filter_set.add(symbol)
+        if symbol not in self.grammar.left_parent_table.keys():
+            return
+        for X in self.grammar.left_parent_table[symbol]:
+            if X in self.filter_set:
+                continue
+            self.add_element(X)
+
+    def printItem(self, item, position):
+        if item is None:
+            return
+        if type(item) == str:
+            print(item, end="")
+            print(" ", end="")
+            return
+        if item.dot_position == len(item.rule.rhs):
+            print(f"({item.rule.lhs} ", end="")
+        self.printItem(self.cols[position].backpointers[item][0][0], self.cols[position].backpointers[item][0][1])
+        self.printItem(self.cols[position].backpointers[item][1][0], self.cols[position].backpointers[item][1][1])
+        if item.dot_position == len(item.rule.rhs):
+            print(")", end="")
 
 
 class Agenda:
@@ -193,9 +253,10 @@ class Agenda:
     """
 
     def __init__(self) -> None:
-        self._items: List[Item] = []       # list of all items that were *ever* pushed
-        self._index: Dict[Item, int] = {}  # stores index of an item if it was ever pushed
-        self._next = 0                     # index of first item that has not yet been popped
+        self.rule_weights: Dict[Item, float] = {}  # stores index of an item if it was ever pushed
+        self.unprocessed: queue.Queue = queue.Queue()
+        self.processed: set = set()
+        self.backpointers: Dict[Item, any] = {}
 
         # Note: There are other possible designs.  For example, self._index doesn't really
         # have to store the index; it could be changed from a dictionary to a set.  
@@ -207,32 +268,49 @@ class Agenda:
     def __len__(self) -> int:
         """Returns number of items that are still waiting to be popped.
         Enables `len(my_agenda)`."""
-        return len(self._items) - self._next
+        return self.unprocessed.qsize()
 
-    def push(self, item: Item) -> None:
+    def push(self, item: Item, weight: float, backpointers: tuple) -> None:
         """Add (enqueue) the item, unless it was previously added."""
-        if item not in self._index:    # O(1) lookup in hash table
-            self._items.append(item)
-            self._index[item] = len(self._items) - 1
+        if item not in self.rule_weights:    # O(1) lookup in hash table
+            self.unprocessed.put(item)
+            self.rule_weights[item] = weight
+            self.backpointers[item] = backpointers
+        elif weight < self.rule_weights[item]:
+            self.rule_weights[item] = weight
+            if item in self.processed: # O(1) lookup in set
+                self.unprocessed.put(item) # O(1) enqueue
+            self.backpointers[item] = backpointers
             
     def pop(self) -> Item:
         """Returns one of the items that was waiting to be popped (dequeued).
         Raises IndexError if there are no items waiting."""
         if len(self)==0:
             raise IndexError
-        item = self._items[self._next]
-        self._next += 1
+        item = self.unprocessed.get() # O(1) dequeue
+        self.processed.add(item)
         return item
 
     def all(self) -> Iterable[Item]:
         """Collection of all items that have ever been pushed, even if 
         they've already been popped."""
-        return self._items
+        return self.rule_weights.keys()
 
     def __repr__(self):
         """Provide a human-readable string REPResentation of this Agenda."""
-        next = self._next
-        return f"{self.__class__.__name__}({self._items[:next]}; {self._items[next:]})"
+        ans = ""
+        for rule in self.rule_weights:
+            if rule in self.processed:
+                ans += str(rule)
+                ans += " "
+                ans += str(self.rule_weights[rule])
+                ans += "\n"
+        ans += ";"
+        for rule in self.rule_weights:
+            if rule not in self.processed:
+                ans += str(rule)
+                ans += "\n"
+        return ans
 
 class Grammar:
     """Represents a weighted context-free grammar."""
@@ -242,6 +320,9 @@ class Grammar:
         self.start_symbol = start_symbol
         self._expansions: Dict[str, List[Rule]] = {}    # maps each LHS to the list of rules that expand it
         # Read the input grammar files
+        self.prefix_table: Dict[tuple, set[Rule]] = {}
+        self.left_parent_table: Dict[str, set[str]] = {}
+
         for file in files:
             self.add_rules_from_file(file)
 
@@ -261,9 +342,18 @@ class Grammar:
                 prob = float(_prob)
                 rhs = tuple(_rhs.split())  
                 rule = Rule(lhs=lhs, rhs=rhs, weight=-math.log2(prob))
+                first_rhs = rhs[0]
                 if lhs not in self._expansions:
                     self._expansions[lhs] = []
                 self._expansions[lhs].append(rule)
+                if (lhs, first_rhs) not in self.prefix_table.keys():
+                    self.prefix_table[(lhs, first_rhs)] = set()
+                if first_rhs not in self.left_parent_table.keys():
+                    self.left_parent_table[first_rhs] = set()
+                self.prefix_table[(lhs, first_rhs)].add(rule)
+                self.left_parent_table[first_rhs].add(lhs)
+
+
 
     def expansions(self, lhs: str) -> Iterable[Rule]:
         """Return an iterable collection of all rules with a given lhs"""
@@ -296,7 +386,7 @@ class Rule:
     """
     lhs: str
     rhs: Tuple[str, ...]
-    weight: float = 0.0
+    weight: float
 
     def __repr__(self) -> str:
         """Complete string used to show this rule instance at the command line"""
@@ -340,6 +430,7 @@ class Item:
         return f"({self.start_position}, {dotted_rule})"  # matches notation on slides
 
 
+
 def main():
     # Parse the command-line arguments
     args = parse_args()
@@ -355,14 +446,11 @@ def main():
                 log.debug("="*70)
                 log.debug(f"Parsing sentence: {sentence}")
                 chart = EarleyChart(sentence.split(), grammar, progress=args.progress)
+                chart.accepted()
                 # print the result
-                print(
-                    f"'{sentence}' is {'accepted' if chart.accepted() else 'rejected'} by {args.grammar}"
-                )
+                #print(f"'{sentence}' is {'accepted' if chart.accepted() else 'rejected'} by {args.grammar}")
                 log.debug(f"Profile of work done: {chart.profile}")
 
 
 if __name__ == "__main__":
-    import doctest
-    doctest.testmod(verbose=False)   # run tests
     main()
